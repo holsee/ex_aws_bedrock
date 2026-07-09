@@ -29,8 +29,38 @@ defmodule ExAws.Bedrock.EventStreamTest do
                EventStream.decode_chunk(chunk)
     end
 
-    test "should handle incomplete chunk", %{incomplete_chunk: chunk} do
-      assert [{:bad_chunk, ^chunk, :invalid_chunk}] = EventStream.decode_chunk(chunk)
+    test "should treat a truncated frame as incomplete (to be buffered, not discarded)",
+         %{incomplete_chunk: chunk} do
+      assert [{:incomplete_chunk, ^chunk}] = EventStream.decode_chunk(chunk)
+    end
+  end
+
+  describe "decode_buffered/2 (cross-chunk reassembly)" do
+    test "reassembles a single frame split across two chunks", %{chunk: chunk} do
+      cut = div(byte_size(chunk), 2)
+      <<a::binary-size(cut), b::binary>> = chunk
+
+      # First chunk is a partial frame: nothing emitted yet, remainder buffered.
+      assert {[], ^a} = EventStream.decode_buffered(a, <<>>)
+
+      # Second chunk completes the frame once prepended with the buffer.
+      assert {[{:chunk, %{"outputText" => _}}], <<>>} = EventStream.decode_buffered(b, a)
+    end
+
+    test "emits complete frames and carries a trailing partial forward",
+         %{multipart_chunk: mp} do
+      # Split inside the tail of the second frame so frame 1 completes in `a`
+      # and frame 2 straddles the boundary.
+      cut = byte_size(mp) - 20
+      <<a::binary-size(cut), b::binary>> = mp
+
+      {frames1, buffer1} = EventStream.decode_buffered(a, <<>>)
+      {frames2, buffer2} = EventStream.decode_buffered(b, buffer1)
+
+      all = frames1 ++ frames2
+      assert length(all) == 2
+      assert Enum.all?(all, &match?({:chunk, _}, &1))
+      assert buffer2 == <<>>
     end
   end
 
