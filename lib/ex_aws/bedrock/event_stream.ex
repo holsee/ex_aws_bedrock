@@ -103,7 +103,11 @@ defmodule ExAws.Bedrock.EventStream do
           &Function.identity/1
         )
 
-      Stream.flat_map(stream, &decode_chunk/1)
+      # Decode with a rolling binary buffer so a single event-stream frame that
+      # is split across two hackney chunks is reassembled rather than dropped.
+      # (Per-chunk `flat_map` decoding loses any frame straddling a chunk
+      # boundary — which happens routinely for larger/slower model responses.)
+      Stream.transform(stream, <<>>, &decode_buffered/2)
     end
 
     @doc """
@@ -164,8 +168,30 @@ defmodule ExAws.Bedrock.EventStream do
         decode_chunks(rest, [{:bad_chunk, data, reason} | acc])
 
       :incomplete ->
-        # May wish to buffer incomplete data
         [{:incomplete_chunk, data} | acc]
+    end
+  end
+
+  # `Stream.transform/3` reducer: prepend the buffered remainder from the
+  # previous hackney chunk, emit every complete frame, and carry the trailing
+  # incomplete bytes forward as the new accumulator.
+  @doc false
+  @spec decode_buffered(binary(), binary()) ::
+          {[{:chunk, map()} | {:bad_chunk, binary(), term()}], binary()}
+  def decode_buffered(data, buffer) do
+    extract_frames(buffer <> data, [])
+  end
+
+  defp extract_frames(data, acc) do
+    case parse_chunk(data) do
+      {:ok, chunk, rest} ->
+        extract_frames(rest, [{:chunk, chunk} | acc])
+
+      {:error, reason, rest} ->
+        extract_frames(rest, [{:bad_chunk, data, reason} | acc])
+
+      :incomplete ->
+        {Enum.reverse(acc), data}
     end
   end
 
@@ -211,6 +237,14 @@ defmodule ExAws.Bedrock.EventStream do
   end
 
   defp parse_chunk(data) when byte_size(data) < @prelude_length do
+    :incomplete
+  end
+
+  # Prelude is readable but the full message has not arrived yet — signal the
+  # caller to buffer and retry once more bytes are appended, rather than
+  # discarding a partial frame as invalid.
+  defp parse_chunk(<<message_total_length::unsigned-32, _rest::binary>> = data)
+       when byte_size(data) < message_total_length do
     :incomplete
   end
 
