@@ -33,7 +33,12 @@ defmodule ExAws.Bedrock.EventStream do
       {"user-agent", @user_agent},
       {"x-amzn-bedrock-accept", "*/*"}
     ]
-    @hackney_options [{:async, :once}]
+    # `protocols: [:http1]` is required under hackney 4.x: over an ALPN-negotiated
+    # HTTP/2 connection its async streaming does not deliver `{:hackney_response, _}`
+    # messages to the caller, so the status/data receives below would block
+    # forever. HTTP/1.1 chunked transfer is what the Bedrock event-stream API
+    # serves anyway. (The option is ignored by hackney 1.x, which has no HTTP/2.)
+    @hackney_options [{:async, :once}, {:protocols, [:http1]}]
 
     @doc """
     Stream of chunks from the response stream.
@@ -84,7 +89,9 @@ defmodule ExAws.Bedrock.EventStream do
             {:error, status, reason} ->
               raise ExAws.Error, "#{to_string(status)}: #{to_string(reason)}"
 
-            ref when is_reference(ref) ->
+            # hackney 4.x async post returns a connection PID; hackney 1.x returned
+            # a Reference. Accept both so streaming works across hackney versions.
+            ref when is_reference(ref) or is_pid(ref) ->
               :ok = :hackney.stream_next(ref)
 
               receive do
